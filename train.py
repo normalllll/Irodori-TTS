@@ -22,6 +22,7 @@ from torch.utils.data import DistributedSampler, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
+from irodori_tts.checkpoint_io import checkpoint_target, recover_checkpoint
 from irodori_tts.config import (
     ModelConfig,
     TrainConfig,
@@ -420,32 +421,30 @@ def save_checkpoint(
         return
 
     if train_config_uses_lora(train_cfg):
-        if path.exists():
-            _safe_unlink(path)
-        path.mkdir(parents=True, exist_ok=True)
         if not hasattr(model, "save_pretrained"):
             raise RuntimeError(
                 "LoRA checkpoint saving requires a PEFT model with save_pretrained()."
             )
-        model.save_pretrained(path)
-        dump_configs(path / "config.json", model_cfg, train_cfg)
-        (path / LORA_METADATA_NAME).write_text(
-            json.dumps({"base_init": base_init}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        torch.save(
-            {
-                "step": step,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": None if scheduler is None else scheduler.state_dict(),
-                "model_config": asdict(model_cfg),
-                "train_config": asdict(train_cfg),
-                "base_init": base_init,
-                DATALOADER_STATE_KEY: dataloader_state,
-                RUNTIME_STATE_KEY: runtime_state,
-            },
-            path / LORA_TRAINER_STATE_NAME,
-        )
+        with checkpoint_target(path, directory=True, step=step) as destination:
+            model.save_pretrained(destination)
+            dump_configs(destination / "config.json", model_cfg, train_cfg)
+            (destination / LORA_METADATA_NAME).write_text(
+                json.dumps({"base_init": base_init}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            torch.save(
+                {
+                    "step": step,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": None if scheduler is None else scheduler.state_dict(),
+                    "model_config": asdict(model_cfg),
+                    "train_config": asdict(train_cfg),
+                    "base_init": base_init,
+                    DATALOADER_STATE_KEY: dataloader_state,
+                    RUNTIME_STATE_KEY: runtime_state,
+                },
+                destination / LORA_TRAINER_STATE_NAME,
+            )
         return
 
     text_encoder_config = None
@@ -455,21 +454,21 @@ def save_checkpoint(
         if isinstance(raw_config, dict):
             text_encoder_config = dict(raw_config)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": None if scheduler is None else scheduler.state_dict(),
-            "model_config": asdict(model_cfg),
-            "train_config": asdict(train_cfg),
-            "text_encoder_config": text_encoder_config,
-            DATALOADER_STATE_KEY: dataloader_state,
-            RUNTIME_STATE_KEY: runtime_state,
-        },
-        path,
-    )
+    with checkpoint_target(path) as destination:
+        torch.save(
+            {
+                "step": step,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": None if scheduler is None else scheduler.state_dict(),
+                "model_config": asdict(model_cfg),
+                "train_config": asdict(train_cfg),
+                "text_encoder_config": text_encoder_config,
+                DATALOADER_STATE_KEY: dataloader_state,
+                RUNTIME_STATE_KEY: runtime_state,
+            },
+            destination,
+        )
 
 
 def _runtime_state_for_checkpoint(*, epoch: int, epoch_step: int) -> dict[str, int]:
@@ -1485,7 +1484,7 @@ def validate_checkpoint_upgrade_partial_load(
 
 
 def _load_checkpoint_payload(path: str | Path, *, map_location) -> dict:
-    checkpoint_path = Path(path)
+    checkpoint_path = recover_checkpoint(Path(path))
     if checkpoint_path.is_dir():
         state_path = checkpoint_path / LORA_TRAINER_STATE_NAME
         payload = torch.load(state_path, map_location=map_location, weights_only=True)
