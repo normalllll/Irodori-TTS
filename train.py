@@ -2707,6 +2707,14 @@ def main() -> None:
         help="Resume full training state from a training checkpoint (.pt or LoRA checkpoint dir).",
     )
     parser.add_argument(
+        "--stop-file",
+        default=None,
+        help=(
+            "Save a resumable checkpoint and exit once this file exists. "
+            "Checked after every optimizer step."
+        ),
+    )
+    parser.add_argument(
         "--init-checkpoint",
         default=None,
         help=(
@@ -5129,6 +5137,33 @@ def main() -> None:
                                     float(valid_metrics["loss"]),
                                 )
                             )
+
+                if args.stop_file is not None:
+                    stop_tensor = torch.tensor(int(Path(args.stop_file).exists()), device=device)
+                    if distributed:
+                        dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+                    if bool(stop_tensor.item()):
+                        stop_loader_state = _collect_dataloader_state(
+                            loader, distributed=distributed, rank=rank, world_size=world_size
+                        )
+                        stop_path = _periodic_checkpoint_path(output_dir, step, train_cfg)
+                        if is_main_process:
+                            save_checkpoint(
+                                stop_path,
+                                raw_model,
+                                optimizer,
+                                scheduler,
+                                step,
+                                model_cfg,
+                                train_cfg,
+                                base_init=base_init,
+                                dataloader_state=stop_loader_state,
+                                runtime_state=_runtime_state_for_checkpoint(
+                                    epoch=epoch, epoch_step=epoch_step
+                                ),
+                            )
+                            progress.write(f"Stop file found; saved {stop_path}.")
+                        return
 
                 if step >= train_cfg.max_steps:
                     break
