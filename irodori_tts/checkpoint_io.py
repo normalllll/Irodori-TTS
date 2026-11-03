@@ -4,10 +4,43 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+
+import numpy as np
+import torch
+
+
+def capture_rng() -> dict:
+    numpy_state = np.random.get_state()
+    # Primitive values and tensors keep torch.load(weights_only=True) usable.
+    return {
+        "python": random.getstate(),
+        "numpy": [numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]],
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng(state: dict) -> None:
+    random.setstate(state["python"])
+    name, keys, position, gaussian, cached = state["numpy"]
+    np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, gaussian, cached))
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+
+
+@contextmanager
+def preserve_rng():
+    state = capture_rng()
+    try:
+        yield
+    finally:
+        restore_rng(state)
 
 
 def recover_checkpoint(target: Path) -> Path:

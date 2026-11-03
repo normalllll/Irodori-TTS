@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -22,7 +23,13 @@ from torch.utils.data import DistributedSampler, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
-from irodori_tts.checkpoint_io import checkpoint_target, recover_checkpoint
+from irodori_tts.checkpoint_io import (
+    capture_rng,
+    checkpoint_target,
+    preserve_rng,
+    recover_checkpoint,
+    restore_rng,
+)
 from irodori_tts.config import (
     ModelConfig,
     TrainConfig,
@@ -141,6 +148,7 @@ DURATION_LENGTH_BUCKET_TOTAL_SIZE = len(DURATION_LENGTH_BUCKETS) * 3
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -434,6 +442,7 @@ def save_checkpoint(
             )
             torch.save(
                 {
+                    "rng_state": capture_rng(),
                     "step": step,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": None if scheduler is None else scheduler.state_dict(),
@@ -457,6 +466,7 @@ def save_checkpoint(
     with checkpoint_target(path) as destination:
         torch.save(
             {
+                "rng_state": capture_rng(),
                 "step": step,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -487,19 +497,25 @@ def _collect_dataloader_state(
     world_size: int,
 ) -> dict:
     local_state = loader.state_dict()
+    pending = getattr(loader, "_irodori_prefetched", None)
+    if pending is not None:
+        local_state = {**local_state, "irodori_prefetched": _move_state_tensors_to_cpu(pending)}
+    local_rng = capture_rng()
     if not distributed:
         return {
             "version": 1,
             "world_size": 1,
             "rank_states": [local_state],
+            "rng_states": [local_rng],
         }
 
     rank_states: list[dict | None] = [None for _ in range(world_size)]
-    dist.all_gather_object(rank_states, local_state)
+    dist.all_gather_object(rank_states, {"loader": local_state, "rng": local_rng})
     return {
         "version": 1,
         "world_size": int(world_size),
-        "rank_states": rank_states,
+        "rank_states": [item["loader"] for item in rank_states],
+        "rng_states": [item["rng"] for item in rank_states],
         "saved_by_rank": int(rank),
     }
 
@@ -1942,6 +1958,10 @@ def _record_batch_stream(batch: dict, stream: torch.cuda.Stream) -> None:
 
 def cuda_prefetch_batches(loader, *, device: torch.device, enabled: bool):
     if not enabled or device.type != "cuda":
+        pending = getattr(loader, "_irodori_prefetched", None)
+        if pending is not None:
+            loader._irodori_prefetched = None
+            yield pending
         yield from loader
         return
 
@@ -1959,13 +1979,20 @@ def cuda_prefetch_batches(loader, *, device: torch.device, enabled: bool):
         with torch.cuda.stream(stream):
             next_batch = _move_batch_to_device(cpu_batch, device)
 
-    preload()
+    pending = getattr(loader, "_irodori_prefetched", None)
+    if pending is not None:
+        with torch.cuda.stream(stream):
+            next_batch = _move_batch_to_device(pending, device)
+    else:
+        preload()
     while next_batch is not None:
         current_stream = torch.cuda.current_stream(device)
         current_stream.wait_stream(stream)
         batch = next_batch
         _record_batch_stream(batch, current_stream)
         preload()
+        # The loader consumed this batch already; persist it with its cursor.
+        loader._irodori_prefetched = next_batch
         yield batch
 
 
@@ -2380,6 +2407,7 @@ def run_meanflow_validation(
     }
 
 
+@preserve_rng()
 def run_validation(
     *,
     model,
@@ -3921,7 +3949,8 @@ def main() -> None:
     if train_cfg.timestep_stratified and is_main_process:
         print("Using stratified logit-normal timestep sampling.")
     train_sampler = None
-    train_loader_generator = None
+    # Isolate iterator base-seed draws from the model RNG during resume.
+    train_loader_generator = torch.Generator().manual_seed(int(train_cfg.seed) + rank)
     if train_cfg.length_bucket_enabled:
         length_bucket_values = train_dataset.length_bucket_values()
         positive_mask = length_bucket_values > 0
@@ -4416,6 +4445,7 @@ def main() -> None:
         if dataloader_state is not None:
             if train_sampler is not None:
                 train_sampler.set_epoch(resume_epoch)
+            loader._irodori_prefetched = dataloader_state.pop("irodori_prefetched", None)
             loader.load_state_dict(dataloader_state)
             resume_loader_state_loaded = True
         if is_main_process:
@@ -4428,6 +4458,16 @@ def main() -> None:
             else:
                 print("Restored dataloader state for mid-epoch resume.")
 
+    if args.resume is not None:
+        rng_states = ckpt.get(DATALOADER_STATE_KEY, {}) or {}
+        rng_states = rng_states.get("rng_states")
+        rng_state = rng_states[rank] if rng_states else ckpt.get("rng_state")
+        if rng_state is not None:
+            restore_rng(rng_state)
+        elif is_main_process:
+            print(
+                "warning: legacy checkpoint has no RNG state; exact stochastic continuation is unavailable."
+            )
     progress = TrainProgress(
         max_steps=train_cfg.max_steps,
         start_step=step,
