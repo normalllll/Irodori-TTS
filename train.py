@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import sys
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -2648,7 +2649,17 @@ def run_validation(
     return metrics
 
 
-def main() -> None:
+def main(*, event_callback: Callable[[str, dict], None] | None = None) -> None:
+    """Run training from sys.argv.
+
+    For applications embedding the trainer: event_callback receives ("running", "progress",
+    "saving", "stopped" or "completed", values) on the main process.
+    """
+
+    def emit(kind: str, **values) -> None:
+        if event_callback is not None and is_main_process:
+            event_callback(kind, values)
+
     parser = argparse.ArgumentParser(description="Train Irodori-TTS.")
     parser.add_argument(
         "--config",
@@ -4476,6 +4487,7 @@ def main() -> None:
             print(
                 "warning: legacy checkpoint has no RNG state; exact stochastic continuation is unavailable."
             )
+    emit("running", step=step, total=train_cfg.max_steps)
     progress = TrainProgress(
         max_steps=train_cfg.max_steps,
         start_step=step,
@@ -4879,6 +4891,12 @@ def main() -> None:
                     scheduler.step()
                 step += 1
                 progress.update(step)
+                emit(
+                    "progress",
+                    step=step,
+                    total=train_cfg.max_steps,
+                    loss=float(step_loss.detach()),
+                )
                 if caption_warmup_active and step >= train_cfg.caption_warmup_steps:
                     caption_warmup_active = False
                     if is_main_process:
@@ -5143,6 +5161,7 @@ def main() -> None:
                     if distributed:
                         dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
                     if bool(stop_tensor.item()):
+                        emit("saving", step=step)
                         stop_loader_state = _collect_dataloader_state(
                             loader, distributed=distributed, rank=rank, world_size=world_size
                         )
@@ -5163,6 +5182,7 @@ def main() -> None:
                                 ),
                             )
                             progress.write(f"Stop file found; saved {stop_path}.")
+                            emit("stopped", step=step, checkpoint=str(stop_path))
                         return
 
                 if step >= train_cfg.max_steps:
@@ -5298,6 +5318,11 @@ def main() -> None:
             if wandb_run is not None:
                 wandb_run.summary["train/final_step"] = step
             progress.write(f"Training finished at step={step}.")
+            emit(
+                "completed",
+                step=step,
+                checkpoint=str(_final_checkpoint_path(output_dir, train_cfg)),
+            )
     finally:
         if progress is not None:
             progress.close()
